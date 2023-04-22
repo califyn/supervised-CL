@@ -1,0 +1,5 @@
+data/
+experiment/
+**/*.pyc
+imagenet/simsiam
+imagenet/barlowtwins
