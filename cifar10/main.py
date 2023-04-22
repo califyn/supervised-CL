@@ -102,7 +102,7 @@ class SupConLoss(nn.Module):
         if labels is not None and mask is not None:
             raise ValueError('Cannot define both `labels` and `mask`')
         elif labels is None and mask is None:
-            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+            mask = torch.eye(batch_size, dtype=torch.float32, requires_grad=True).to(device) # fix here: requires grad
         elif labels is not None:
             labels = labels.contiguous().view(-1, 1)
             if labels.shape[0] != batch_size:
@@ -111,9 +111,8 @@ class SupConLoss(nn.Module):
         else:
             mask = mask.float().to(device)
 
-        contrast_count = features.shape[1]
+        contrast_count = features.shape[1] # = n_views
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-        print(contrast_feature.shape)
         if self.contrast_mode == 'one':
             anchor_feature = features[:, 0]
             anchor_count = 1
@@ -220,7 +219,8 @@ def knn_loop(encoder, train_loader, test_loader):
     accuracy = knn_monitor(net=encoder,
                            memory_data_loader=train_loader,
                            test_data_loader=test_loader,
-                           k=200,
+                           k=200 if device != torch.device('mps') else 16, # mps needs a small k
+                           device=device,
                            hide_progress=True)
     return accuracy
 
@@ -317,6 +317,7 @@ def ssl_loop(args, encoder=None):
 
         # epoch
         for it, (inputs, y) in enumerate(train_loader, start=(e - 1) * len(train_loader)):
+            print(f"Step {it}/{len(train_loader)}...", end="\r")
             # adjust
             lr = adjust_learning_rate(epochs=args.epochs,
                                       warmup_epochs=args.warmup_epochs,
@@ -330,31 +331,25 @@ def ssl_loop(args, encoder=None):
                 predictor.zero_grad()
 
             def forward_step():
-                print(inputs.shape)
-                x1 = inputs[0].to(device)
-                x2 = inputs[1].to(device)
-                b1 = backbone(x1)
-                b2 = backbone(x2)
-                z1 = projector(b1)
-                z2 = projector(b2)
+                if args.transforms:
+                    x1 = inputs[0].to(device)
+                    x2 = inputs[1].to(device)
+                    b1 = backbone(x1)
+                    b2 = backbone(x2)
+                    z1 = projector(b1)
+                    z2 = projector(b2)
+                    z = torch.stack((z1, z2), axis=1)
+                else:
+                    x = inputs.to(device)
+                    b = backbone(x)
+                    z = torch.unsqueeze(projector(b), 1)
 
                 # forward pass
                 if args.loss == 'simclr':
-                    #loss = info_nce_loss(z1, z2) / 2 + info_nce_loss(z2, z1) / 2
-                    loss = loss_inst(np.stack((z1, z2), axis=1))
-                elif args.loss == 'simsiam':
-                    p1 = predictor(z1)
-                    p2 = predictor(z2)
-                    loss = negative_cosine_similarity_loss(p1, z2) / 2 + negative_cosine_similarity_loss(p2, z1) / 2
+                    loss = loss_inst(z)
                 else:
                     raise
 
-                if args.lmbd > 0:
-                    rotated_images, rotated_labels = rotate_images(inputs[2])
-                    b = backbone(rotated_images)
-                    logits = main_branch.predictor2(b)
-                    rot_loss = F.cross_entropy(logits, rotated_labels)
-                    loss += args.lmbd * rot_loss
                 return loss
 
             # optimization step
@@ -364,15 +359,10 @@ def ssl_loop(args, encoder=None):
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                if args.loss == 'simsiam':
-                    scaler.step(pred_optimizer)
-
             else:
                 loss = forward_step()
                 loss.backward()
                 optimizer.step()
-                if args.loss == 'simsiam':
-                    pred_optimizer.step()
 
         if args.fp16:
             with autocast():
@@ -527,7 +517,6 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_epochs', default=10, type=int)
     parser.add_argument('--path_dir', default='../experiment', type=str)
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--lmbd', default=0.0, type=float)
     parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--checkpoint_path', default=None, type=str)
     parser.add_argument('--fp16', action='store_true')
