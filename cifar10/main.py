@@ -18,10 +18,65 @@ import torchvision.transforms as T
 from resnet import resnet18
 from utils import knn_monitor, fix_seed
 
+from PIL import Image
+
 normalize = T.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
 single_transform = T.Compose([T.ToTensor(), normalize])
 
 device = get_device()
+
+class RestrictedClassDataset(torchvision.datasets.VisionDataset):
+    def __init__(self, dataset, classes=None, class_map=None):
+        super().__init__(dataset.root, transform=dataset.transform, target_transform=dataset.target_transform)
+
+        classes_was_none = classes == None
+        if classes_was_none:
+            classes = list(set(dataset.targets))
+        self.classes = classes
+
+        if class_map != None and not classes_was_none: # only map if classes were provided
+            classes = [class_map[c] for c in classes]
+
+        # convert dataset.targets to tensor
+        tensor_targets = torch.tensor(dataset.targets)
+        class_mask = sum(tensor_targets == class_ for class_ in classes).bool()
+        self.data = dataset.data[class_mask]
+        self.targets = tensor_targets[class_mask]
+        
+        for target in classes:
+            self.targets[self.targets == target] = torch.tensor(classes.index(target))
+
+    def __getitem__(self, index):
+        img, target = self.data[index], self.targets[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+
+    def __len__(self):
+        return len(self.data)
+
+def dataset_class_mapper(dataset, classes):
+    return RestrictedClassDataset(dataset, classes=classes, class_map={
+        'airplane': 0,
+        'automobile': 1,
+        'bird': 2,
+        'cat': 3,
+        'deer': 4,
+        'dog': 5,
+        'frog': 6,
+        'horse': 7,
+        'ship': 8,
+        'truck': 9
+    }) # cifar map
 
 class ContrastiveLearningTransform:
     def __init__(self):
@@ -102,7 +157,7 @@ class SupConLoss(nn.Module):
         if labels is not None and mask is not None:
             raise ValueError('Cannot define both `labels` and `mask`')
         elif labels is None and mask is None:
-            mask = torch.eye(batch_size, dtype=torch.float32, requires_grad=True).to(device) # fix here: requires grad
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device) # fix here: requires grad
         elif labels is not None:
             labels = labels.contiguous().view(-1, 1)
             if labels.shape[0] != batch_size:
@@ -110,6 +165,9 @@ class SupConLoss(nn.Module):
             mask = torch.eq(labels, labels.T).float().to(device)
         else:
             mask = mask.float().to(device)
+
+        # normalize features
+        features = torch.nn.functional.normalize(features, dim=2)
 
         contrast_count = features.shape[1] # = n_views
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
@@ -243,9 +301,9 @@ def ssl_loop(args, encoder=None):
 
     # dataset
     train_loader = torch.utils.data.DataLoader(
-        dataset=torchvision.datasets.CIFAR10(
+        dataset=dataset_class_mapper(torchvision.datasets.CIFAR10(
             '../data', train=True, transform=ContrastiveLearningTransform() if args.transforms else single_transform, download=True
-        ),
+        ), args.classes),
         shuffle=True,
         batch_size=args.bsz,
         pin_memory=True,
@@ -253,18 +311,18 @@ def ssl_loop(args, encoder=None):
         drop_last=True
     )
     memory_loader = torch.utils.data.DataLoader(
-        dataset=torchvision.datasets.CIFAR10(
+        dataset=dataset_class_mapper(torchvision.datasets.CIFAR10(
             '../data', train=True, transform=single_transform, download=True
-        ),
+        ), args.classes),
         shuffle=False,
         batch_size=args.bsz,
         pin_memory=True,
         num_workers=args.num_workers,
     )
     test_loader = torch.utils.data.DataLoader(
-        dataset=torchvision.datasets.CIFAR10(
+        dataset=dataset_class_mapper(torchvision.datasets.CIFAR10(
             '../data', train=False, transform=single_transform, download=True,
-        ),
+        ), args.classes),
         shuffle=False,
         batch_size=args.bsz,
         pin_memory=True,
@@ -308,7 +366,7 @@ def ssl_loop(args, encoder=None):
     scaler = GradScaler()
 
     # training
-    loss_inst = SupConLoss()
+    loss_inst = SupConLoss(temperature=args.temperature, base_temperature=args.temperature)
     for e in range(1, args.epochs + 1):
         # declaring train
         main_branch.train()
@@ -317,7 +375,7 @@ def ssl_loop(args, encoder=None):
 
         # epoch
         for it, (inputs, y) in enumerate(train_loader, start=(e - 1) * len(train_loader)):
-            print(f"Step {it}/{len(train_loader)}...", end="\r")
+            print(f"Step {it % len(train_loader) + 1}/{len(train_loader)}...", end="\r")
             # adjust
             lr = adjust_learning_rate(epochs=args.epochs,
                                       warmup_epochs=args.warmup_epochs,
@@ -346,7 +404,7 @@ def ssl_loop(args, encoder=None):
 
                 # forward pass
                 if args.loss == 'simclr':
-                    loss = loss_inst(z)
+                    loss = loss_inst(z, labels=y)
                 else:
                     raise
 
@@ -403,7 +461,7 @@ def eval_loop(encoder, file_to_update, ind=None):
     ])
 
     train_loader = torch.utils.data.DataLoader(
-        dataset=torchvision.datasets.CIFAR10('../data', train=True, transform=train_transform, download=True),
+        dataset=dataset_class_mapper(torchvision.datasets.CIFAR10('../data', train=True, transform=train_transform, download=True), args.classes),
         shuffle=True,
         batch_size=256,
         pin_memory=True,
@@ -411,7 +469,7 @@ def eval_loop(encoder, file_to_update, ind=None):
         drop_last=True
     )
     test_loader = torch.utils.data.DataLoader(
-        dataset=torchvision.datasets.CIFAR10('../data', train=False, transform=test_transform, download=True),
+        dataset=dataset_class_mapper(torchvision.datasets.CIFAR10('../data', train=False, transform=test_transform, download=True), args.classes),
         shuffle=False,
         batch_size=256,
         pin_memory=True,
@@ -520,10 +578,16 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--checkpoint_path', default=None, type=str)
     parser.add_argument('--fp16', action='store_true')
+    parser.add_argument('--device', default=0, type=int)
+    parser.add_argument('--temperature', default=0.5, type=float)
     
     # Specific to supervised mode
     parser.add_argument('--transforms', action='store_true')
+    parser.add_argument('--classes', default=None, type=str)
 
     args = parser.parse_args()
+    device = get_device(idx=args.device)
+    if args.classes != None:
+        args.classes = args.classes.split(",") # comma-sep
 
     main(args)

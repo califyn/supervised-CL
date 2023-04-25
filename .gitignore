@@ -3,3 +3,4 @@ experiment/
 **/*.pyc
 imagenet/simsiam
 imagenet/barlowtwins
+**/*.html
