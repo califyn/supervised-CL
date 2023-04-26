@@ -133,7 +133,7 @@ class SupConLoss(nn.Module):
         self.contrast_mode = contrast_mode
         self.base_temperature = base_temperature
 
-    def forward(self, features, labels=None, mask=None, thresh=0.0):
+    def forward(self, features, labels, thresh=0.0):
         """Compute loss for model. If both `labels` and `mask` are None,
         it degenerates to SimCLR unsupervised loss:
         https://arxiv.org/pdf/2002.05709.pdf
@@ -143,6 +143,8 @@ class SupConLoss(nn.Module):
             labels: ground truth of shape [bsz].
             mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
                 has the same class as sample i. Can be asymmetric.
+            thresh: scalar in range 0 to 1, for what fraction of the class should be
+                considered as positive pairs
         Returns:
             A loss scalar.
         """
@@ -154,18 +156,15 @@ class SupConLoss(nn.Module):
             features = features.view(features.shape[0], features.shape[1], -1)
 
         batch_size = features.shape[0]
-        if labels is not None and mask is not None:
-            raise ValueError('Cannot define both `labels` and `mask`')
-        elif labels is None and mask is None:
-            mask = torch.eye(batch_size, dtype=torch.float32).to(device) # fix here: requires grad
-        elif labels is not None:
-            labels = labels.contiguous().view(-1, 1)
+
+        if labels is not None:
+            labels = labels.contiguous()
             if labels.shape[0] != batch_size:
                 raise ValueError('Num of labels does not match num of features')
-            mask = torch.eq(labels, labels.T).float().to(device)
+            # mask = torch.eq(labels, labels.T).float().to(device)
         else:
-            mask = mask.float().to(device)
-
+            raise TypeError("Labels cannot be None.")
+        
         # normalize features
         features = torch.nn.functional.normalize(features, dim=2)
 
@@ -179,25 +178,62 @@ class SupConLoss(nn.Module):
             anchor_count = contrast_count
         else:
             raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+        
+        contrast_labels = labels.repeat(contrast_count).contiguous()
+        anchor_labels = labels.repeat(anchor_count).contiguous()
+
+        sorted_anchor_labels, a_idx = torch.sort(anchor_labels, stable = True)
+        sorted_anchor_feature = anchor_feature[a_idx]
 
         # compute logits
+        # anchor_dot_contrast and logits are sorted by label along dimension 0
         anchor_dot_contrast = torch.div(
-            torch.matmul(anchor_feature, contrast_feature.T),
+            torch.matmul(sorted_anchor_feature, contrast_feature.T),
             self.temperature)
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
 
-        # tile mask
-        mask = mask.repeat(anchor_count, contrast_count)
+        # num_labels = torch.unique(labels).max() + 1
+        
+        # calculating percentiles for positive pairs
+        # label_percentile_dists = torch.zeros(num_labels).detach()
+
+        # masks for values in the same class
+        mask = torch.eq(sorted_anchor_labels.view(-1,1), contrast_labels.view(1,-1))
+
         # mask-out self-contrast cases
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
             torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
             0
-        )
-        mask = mask * logits_mask
+        )[a_idx]
+        mask = mask * logits_mask # selects elements of the same class and not along diagonal
+
+        # offset version of anchor_dot_contrast that masks diagonal entries (self) and not in same class
+        temp = ((anchor_dot_contrast + 2/self.temperature) * mask)
+        sorted_temp, _ = temp.sort(dim = -1)
+
+        quantiles = []
+        start = 0
+
+        for label_count in labels.unique(return_counts = True)[1]:
+            quantiles.append(
+                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -(contrast_count * label_count + 1):],
+                1 - thresh,
+                dim = -1,
+                interpolation = 'higher')
+                )
+            start += anchor_count * label_count
+
+        quantiles = torch.cat(quantiles).detach()
+
+        # quantiles contains the threshold for each row
+        threshold_mask = temp >= quantiles.view(-1, 1)
+
+        mask = mask * threshold_mask
+            
 
         # compute log_prob
         exp_logits = torch.exp(logits) * logits_mask
