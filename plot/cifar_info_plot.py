@@ -208,13 +208,11 @@ def main_plot(args):
 
     if args.normalize:
         embeds = embeds / np.sqrt(np.sum(np.square(embeds), axis=1))[:, np.newaxis]
-    """
-    means = []
-    for i in range(10):
-        means.append(np.mean(embeds[vals["targets"] == i], axis=0))
-    means = np.array(means)
-    print(means)
-    """
+        means = []
+        for i in range(10):
+            means.append(np.mean(embeds[vals["targets"] == i], axis=0))
+        means = np.array(means)
+        print(means)
 
     """
     mask = np.equal(vals["targets"], 2)
