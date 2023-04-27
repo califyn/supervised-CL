@@ -201,7 +201,7 @@ class SupConLoss(nn.Module):
         # label_percentile_dists = torch.zeros(num_labels).detach()
 
         # masks for values in the same class
-        mask = torch.eq(anchor_labels.view(-1,1), contrast_labels.view(1,-1))
+        mask = torch.eq(anchor_labels.view(-1,1), contrast_labels.view(1,-1)).to(device)
 
         # mask-out self-contrast cases
         logits_mask = torch.scatter(
@@ -214,7 +214,7 @@ class SupConLoss(nn.Module):
 
         # aug_mask is tiled identity matrices, no need to remove main diagonal
         # because it gets zeroed out when multiplied by logits_mask
-        aug_mask = torch.eye(batch_size).tile((anchor_count, contrast_count))
+        aug_mask = torch.eye(batch_size).tile((anchor_count, contrast_count)).to(device)
 
         # offset version of anchor_dot_contrast that masks diagonal entries (self) and not in same class
         # and removes its own augmented views
@@ -228,7 +228,7 @@ class SupConLoss(nn.Module):
         for label_count in labels.unique(return_counts = True, sorted = True)[1]:
             # in the case that a label has only one sample, then that row becomes all 0
             quantiles.append(
-                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -contrast_count * (label_count - 1):],
+                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -contrast_count * (label_count - 1):].to(torch.float),
                 1 - thresh,
                 dim = -1,
                 interpolation = 'linear')
@@ -241,7 +241,6 @@ class SupConLoss(nn.Module):
         threshold_mask = temp > quantiles.view(-1, 1)
 
         mask = mask * torch.logical_or(threshold_mask, aug_mask)
-            
 
         # compute log_prob
         exp_logits = torch.exp(logits) * logits_mask
@@ -327,17 +326,6 @@ def knn_loop(encoder, train_loader, test_loader):
 
 
 def ssl_loop(args, encoder=None):
-    if args.checkpoint_path:
-        print('checkpoint provided => moving to evaluation')
-        main_branch = Branch(args, encoder=encoder)
-        main_branch.to(device)
-
-        saved_dict = torch.load(os.path.join(args.checkpoint_path))['state_dict']
-        main_branch.load_state_dict(saved_dict)
-        file_to_update = open(os.path.join(args.path_dir, 'train_and_eval.log'), 'a')
-        file_to_update.write(f'evaluating {args.checkpoint_path}\n')
-        return main_branch.encoder, file_to_update
-
     # logging
     os.makedirs(args.path_dir, exist_ok=True)
     file_to_update = open(os.path.join(args.path_dir, 'train_and_eval.log'), 'w')
@@ -374,8 +362,19 @@ def ssl_loop(args, encoder=None):
 
     # models
 
-    main_branch = Branch(args, encoder=encoder)
-    main_branch.to(device)
+    if args.checkpoint_path:
+        print('checkpoint provided')
+        main_branch = Branch(args, encoder=encoder)
+        main_branch.to(device)
+
+        saved_dict = torch.load(os.path.join(args.checkpoint_path))['state_dict']
+        main_branch.load_state_dict(saved_dict)
+        file_to_update = open(os.path.join(args.path_dir, 'train_and_eval.log'), 'a')
+        #file_to_update.write(f'evaluating {args.checkpoint_path}\n')
+        #return main_branch.encoder, file_to_update
+    else:
+        main_branch = Branch(args, encoder=encoder)
+        main_branch.to(device)
 
     if args.loss == 'simsiam':
         dim_proj = [int(x) for x in args.dim_proj.split(',')]
