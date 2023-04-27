@@ -212,8 +212,13 @@ class SupConLoss(nn.Module):
         )
         mask = mask * logits_mask # selects elements of the same class and not along diagonal
 
+        # aug_mask is tiled identity matrices, no need to remove main diagonal
+        # because it gets zeroed out when multiplied by logits_mask
+        aug_mask = torch.eye(batch_size).tile((anchor_count, contrast_count))
+
         # offset version of anchor_dot_contrast that masks diagonal entries (self) and not in same class
-        temp = ((anchor_dot_contrast + 2/self.temperature) * mask)
+        # and removes its own augmented views
+        temp = ((anchor_dot_contrast + 2/self.temperature) * mask  * (1 - aug_mask))
         
         sorted_temp, _ = temp[a_idx].sort(dim = -1)
 
@@ -221,20 +226,21 @@ class SupConLoss(nn.Module):
         start = 0
 
         for label_count in labels.unique(return_counts = True, sorted = True)[1]:
+            # in the case that a label has only one sample, then that row becomes all 0
             quantiles.append(
-                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -contrast_count * label_count + 1:],
+                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -contrast_count * (label_count - 1):],
                 1 - thresh,
                 dim = -1,
-                interpolation = 'higher')
+                interpolation = 'linear')
                 )
             start += anchor_count * label_count
 
         quantiles = torch.cat(quantiles).detach()[inv_idx]
 
         # quantiles contains the threshold for each row
-        threshold_mask = temp >= quantiles.view(-1, 1)
+        threshold_mask = temp > quantiles.view(-1, 1)
 
-        mask = mask * threshold_mask
+        mask = mask * torch.logical_or(threshold_mask, aug_mask)
             
 
         # compute log_prob
