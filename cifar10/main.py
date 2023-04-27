@@ -182,13 +182,13 @@ class SupConLoss(nn.Module):
         contrast_labels = labels.repeat(contrast_count).contiguous()
         anchor_labels = labels.repeat(anchor_count).contiguous()
 
-        sorted_anchor_labels, a_idx = torch.sort(anchor_labels, stable = True)
-        sorted_anchor_feature = anchor_feature[a_idx]
+        _, a_idx = torch.sort(anchor_labels, stable = True)
+        _, inv_idx = torch.sort(a_idx, stable = True)
 
         # compute logits
         # anchor_dot_contrast and logits are sorted by label along dimension 0
         anchor_dot_contrast = torch.div(
-            torch.matmul(sorted_anchor_feature, contrast_feature.T),
+            torch.matmul(anchor_feature, contrast_feature.T),
             self.temperature)
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
@@ -200,7 +200,7 @@ class SupConLoss(nn.Module):
         # label_percentile_dists = torch.zeros(num_labels).detach()
 
         # masks for values in the same class
-        mask = torch.eq(sorted_anchor_labels.view(-1,1), contrast_labels.view(1,-1))
+        mask = torch.eq(anchor_labels.view(-1,1), contrast_labels.view(1,-1))
 
         # mask-out self-contrast cases
         logits_mask = torch.scatter(
@@ -208,17 +208,18 @@ class SupConLoss(nn.Module):
             1,
             torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
             0
-        )[a_idx]
+        )
         mask = mask * logits_mask # selects elements of the same class and not along diagonal
 
         # offset version of anchor_dot_contrast that masks diagonal entries (self) and not in same class
         temp = ((anchor_dot_contrast + 2/self.temperature) * mask)
-        sorted_temp, _ = temp.sort(dim = -1)
+        
+        sorted_temp, _ = temp[a_idx].sort(dim = -1)
 
         quantiles = []
         start = 0
 
-        for label_count in labels.unique(return_counts = True)[1]:
+        for label_count in labels.unique(return_counts = True, sorted = True)[1]:
             quantiles.append(
                 torch.quantile(sorted_temp[start:start + anchor_count * label_count, -(contrast_count * label_count + 1):],
                 1 - thresh,
@@ -227,7 +228,7 @@ class SupConLoss(nn.Module):
                 )
             start += anchor_count * label_count
 
-        quantiles = torch.cat(quantiles).detach()
+        quantiles = torch.cat(quantiles).detach()[inv_idx]
 
         # quantiles contains the threshold for each row
         threshold_mask = temp >= quantiles.view(-1, 1)
