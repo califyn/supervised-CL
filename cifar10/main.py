@@ -189,7 +189,7 @@ class SupConLoss(nn.Module):
         # compute logits
         # anchor_dot_contrast and logits are sorted by label along dimension 0
         anchor_dot_contrast = torch.div(
-            torch.matmul(sorted_anchor_feature, contrast_feature.T),
+            torch.matmul(anchor_feature, contrast_feature.T),
             self.temperature)
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
@@ -222,7 +222,7 @@ class SupConLoss(nn.Module):
 
         for label_count in labels.unique(return_counts = True, sorted = True)[1]:
             quantiles.append(
-                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -(contrast_count * label_count + 1):],
+                torch.quantile(sorted_temp[start:start + anchor_count * label_count, -contrast_count * label_count + 1:],
                 1 - thresh,
                 dim = -1,
                 interpolation = 'higher')
